@@ -10,6 +10,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -35,14 +36,14 @@ import kotlin.math.max
 class OverlayService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var wm: WindowManager
-    private var layer: View? = null
+    private var bubble: TextView? = null
     private var popup: TextView? = null
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
     private var vdisplay: VirtualDisplay? = null
-    @Volatile private var latest: Bitmap? = null
-    private var sx = 0f
-    private var sy = 0f
+    private var screenW = 0
+    private var screenH = 0
+    private var candidate: Bitmap? = null
 
     private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
     private val translator by lazy {
@@ -53,7 +54,6 @@ class OverlayService : Service() {
                 .build()
         )
     }
-    private val hold = Runnable { onHold(sx, sy) }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -69,7 +69,7 @@ class OverlayService : Service() {
             override fun onStop() { stopSelf() }
         }, handler)
         setupCapture()
-        showLayer()
+        showBubble()
         translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
         return START_NOT_STICKY
     }
@@ -83,7 +83,7 @@ class OverlayService : Service() {
         )
         val n = Notification.Builder(this, "t")
             .setContentTitle("الترجمة شغالة")
-            .setContentText("اضغط إيقاف عند الانتهاء")
+            .setContentText("اسحب الفقاعة فوق الكلمة. اضغط إيقاف عند الانتهاء")
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .addAction(
                 Notification.Action.Builder(
@@ -96,73 +96,114 @@ class OverlayService : Service() {
     private fun setupCapture() {
         val m = DisplayMetrics()
         @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(m)
-        val w = m.widthPixels
-        val h = m.heightPixels
-        val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-        r.setOnImageAvailableListener({ rd ->
-            val img = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                val p = img.planes[0]
-                val bmp = Bitmap.createBitmap(p.rowStride / p.pixelStride, h, Bitmap.Config.ARGB_8888)
-                bmp.copyPixelsFromBuffer(p.buffer)
-                val crop = Bitmap.createBitmap(bmp, 0, 0, w, h)
-                if (crop !== bmp) bmp.recycle()
-                latest = crop
-            } finally { img.close() }
-        }, handler)
+        screenW = m.widthPixels
+        screenH = m.heightPixels
+        val r = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
         reader = r
         vdisplay = projection?.createVirtualDisplay(
-            "cap", w, h, m.densityDpi,
+            "cap", screenW, screenH, m.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, handler
         )
     }
 
-    private fun showLayer() {
-        val v = View(this)
-        v.setBackgroundColor(0x12000000)
-        v.setOnTouchListener { _, e ->
-            when (e.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    sx = e.rawX; sy = e.rawY
-                    handler.postDelayed(hold, 1500)
-                }
-                MotionEvent.ACTION_MOVE ->
-                    if (hypot(e.rawX - sx, e.rawY - sy) > 40) handler.removeCallbacks(hold)
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> handler.removeCallbacks(hold)
+    private fun toBitmap(img: Image): Bitmap {
+        val p = img.planes[0]
+        val bmp = Bitmap.createBitmap(p.rowStride / p.pixelStride, screenH, Bitmap.Config.ARGB_8888)
+        bmp.copyPixelsFromBuffer(p.buffer)
+        val crop = Bitmap.createBitmap(bmp, 0, 0, screenW, screenH)
+        if (crop !== bmp) bmp.recycle()
+        return crop
+    }
+
+    private fun showBubble() {
+        val size = (56 * resources.displayMetrics.density).toInt()
+        val tv = TextView(this).apply {
+            text = "ت"
+            textSize = 22f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xBB1565C0.toInt())
             }
-            true
         }
         val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+            size, size,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         )
-        wm.addView(v, lp)
-        layer = v
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = 30
+        lp.y = 500
+        var ix = 0
+        var iy = 0
+        var tx = 0f
+        var ty = 0f
+        var moved = false
+        tv.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    ix = lp.x; iy = lp.y; tx = e.rawX; ty = e.rawY; moved = false
+                    removePopup()
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = e.rawX - tx
+                    val dy = e.rawY - ty
+                    if (hypot(dx, dy) > 15) moved = true
+                    lp.x = ix + dx.toInt()
+                    lp.y = iy + dy.toInt()
+                    wm.updateViewLayout(tv, lp)
+                }
+                MotionEvent.ACTION_UP -> if (moved) {
+                    capture((lp.x + size / 2).toFloat(), (lp.y + size / 2).toFloat())
+                }
+            }
+            true
+        }
+        wm.addView(tv, lp)
+        bubble = tv
     }
 
-    private fun onHold(x: Float, y: Float) {
-        removePopup()
+    private fun capture(x: Float, y: Float) {
+        val r = reader ?: return
+        try {
+            while (true) { (r.acquireNextImage() ?: break).close() }
+        } catch (_: Exception) {}
+        candidate = null
+        r.setOnImageAvailableListener({ rd ->
+            try {
+                val img = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try { candidate = toBitmap(img) } finally { img.close() }
+            } catch (_: Exception) {}
+        }, handler)
+        bubble?.visibility = View.INVISIBLE
         handler.postDelayed({
-            val bmp = latest ?: return@postDelayed
-            recognizer.process(InputImage.fromBitmap(bmp, 0)).addOnSuccessListener { t ->
-                var best: String? = null
-                var bd = Float.MAX_VALUE
-                for (b in t.textBlocks) for (l in b.lines) for (e in l.elements) {
-                    val r = e.boundingBox ?: continue
-                    val dx = max(max(r.left - x, x - r.right), 0f)
-                    val dy = max(max(r.top - y, y - r.bottom), 0f)
-                    val d = hypot(dx, dy)
-                    if (d < bd) { bd = d; best = e.text }
-                }
-                val word = best?.trim { !it.isLetterOrDigit() }
-                if (word.isNullOrEmpty() || bd > 80f) show("لم أجد كلمة هنا", x, y)
-                else translate(word, x, y)
-            }.addOnFailureListener { show("تعذّرت قراءة الشاشة", x, y) }
-        }, 400)
+            r.setOnImageAvailableListener(null, null)
+            bubble?.visibility = View.VISIBLE
+            val bmp = candidate
+            if (bmp == null) show("تعذّر التقاط الشاشة، جرّب تاني", x, y)
+            else ocr(bmp, x, y)
+        }, 450)
+    }
+
+    private fun ocr(bmp: Bitmap, x: Float, y: Float) {
+        recognizer.process(InputImage.fromBitmap(bmp, 0)).addOnSuccessListener { t ->
+            var best: String? = null
+            var bd = Float.MAX_VALUE
+            for (b in t.textBlocks) for (l in b.lines) for (e in l.elements) {
+                val r = e.boundingBox ?: continue
+                val dx = max(max(r.left - x, x - r.right), 0f)
+                val dy = max(max(r.top - y, y - r.bottom), 0f)
+                val d = hypot(dx, dy)
+                if (d < bd) { bd = d; best = e.text }
+            }
+            val word = best?.trim { !it.isLetterOrDigit() }
+            if (word.isNullOrEmpty() || bd > 90f) show("لم أجد كلمة هنا", x, y)
+            else translate(word, x, y)
+        }.addOnFailureListener { show("تعذّرت قراءة الشاشة", x, y) }
     }
 
     private fun translate(word: String, x: Float, y: Float) {
@@ -189,15 +230,18 @@ class OverlayService : Service() {
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         )
         lp.gravity = Gravity.TOP or Gravity.START
         lp.x = max(0, x.toInt() - 120)
-        lp.y = y.toInt() + 80
+        lp.y = y.toInt() + 90
         wm.addView(tv, lp)
         popup = tv
-        handler.postDelayed({ removePopup() }, 4000)
+        handler.postDelayed({ removePopup() }, 5000)
     }
 
     private fun removePopup() {
@@ -208,7 +252,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         removePopup()
-        layer?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        bubble?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         vdisplay?.release()
         reader?.close()
         projection?.stop()
